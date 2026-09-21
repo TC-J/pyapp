@@ -7,7 +7,9 @@ authors = [
     { name = "TC Jowers", email = "jowerstc@outlook.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
 pyapp = "pyapp:main"
