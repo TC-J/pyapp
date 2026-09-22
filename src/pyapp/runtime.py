@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import configparser
+import copy
 import json
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Self
 
-import tomli_w
+import tomllib
 import yaml
 from platformdirs import PlatformDirs
 
@@ -22,6 +23,19 @@ _FORMATS: dict[str, FileFormat] = {
     "yml": "yaml",
     "json": "json",
     "ini": "ini",
+}
+_FORMAT_EXTENSIONS: tuple[tuple[str, FileFormat], ...] = (
+    (".toml", "toml"),
+    (".yaml", "yaml"),
+    (".yml", "yaml"),
+    (".json", "json"),
+    (".ini", "ini"),
+)
+_DEFAULT_EXTENSION: dict[FileFormat, str] = {
+    "toml": ".toml",
+    "yaml": ".yaml",
+    "json": ".json",
+    "ini": ".ini",
 }
 _ROOTS = frozenset({"data", "config"})
 _MISSING = object()
@@ -50,6 +64,7 @@ def parse_spec(spec: str) -> StorageSpec:
     Examples::
 
         pyapp.toml:a              -> {config}/pyapp.toml  key a
+        pyapp:a                   -> {config}/pyapp  (format inferred later)
         config.settings.yaml:db.host
         data.cache.state.json:count
         data.logs                 -> {data}/logs  (directory)
@@ -92,8 +107,10 @@ class AppStorageManager:
     Get and set nested keys in TOML, YAML, JSON, and INI files::
 
         store = AppStorageManager("my-app", "Acme")
-        store.set("settings.toml:database.host", "localhost")
-        store.get("data.cache.state.json:count", default=0)
+        store["settings:database.host"] = "localhost"
+        store.get("settings:cluster_name")  # creates settings.yaml if needed
+        store.ensure_file("data.cache.state")
+        store.ensure_dir("data.cache.images")
     """
 
     def __init__(
@@ -106,12 +123,19 @@ class AppStorageManager:
         base_config_dir: str | Path | None = None,
         ensure_exists: bool = True,
         roaming: bool = False,
+        default_format: FileFormat = "yaml",
     ) -> None:
         author: str | None | Literal[False]
         if appauthor == "":
             author = None
         else:
             author = appauthor
+        if default_format not in _DEFAULT_EXTENSION:
+            raise ValueError(
+                f"unsupported default_format {default_format!r}; "
+                f"expected one of {', '.join(_DEFAULT_EXTENSION)}"
+            )
+        self._default_format = default_format
 
         dirs = PlatformDirs(
             appname,
@@ -140,6 +164,10 @@ class AppStorageManager:
     def config_dir(self) -> Path:
         return self._config_dir
 
+    @property
+    def default_format(self) -> FileFormat:
+        return self._default_format
+
     def resolve(self, spec: str | StorageSpec, *, ensure: bool = False) -> Path:
         """Resolve a dotted spec to an absolute path under data or config."""
         parsed = spec if isinstance(spec, StorageSpec) else parse_spec(spec)
@@ -153,46 +181,219 @@ class AppStorageManager:
         return path
 
     def get(self, spec: str, default: Any = None) -> Any:
-        """Read a file or nested key. Missing files/keys return ``default``."""
-        parsed = parse_spec(spec)
-        fmt = self._require_file(parsed, spec)
-        path = self.resolve(parsed)
-        if not path.is_file():
-            return default
-        document = _read_document(path, fmt)
-        if not parsed.keys:
-            return document if fmt != "ini" else _ini_as_dict(document)
-        value = _lookup(document, parsed.keys, default=_MISSING)
+        """Read a file or nested key, creating the file if it does not exist.
+
+        Missing keys return ``default``. A missing file is created as an empty
+        mapping, using ``default_format`` when the spec omits an extension.
+        """
+        self.ensure_file(spec)
+        value = self._fetch(spec)
         return default if value is _MISSING else value
 
     def set(self, spec: str, value: Any) -> Self:
         """Write a file or nested key, creating parents and the file as needed."""
-        parsed = parse_spec(spec)
-        fmt = self._require_file(parsed, spec)
-        path = self.resolve(parsed, ensure=True)
+        parsed, fmt = self._parsed_file(spec)
+        path = self.ensure_file(spec)
         if parsed.keys:
-            document = (
-                _read_document(path, fmt)
-                if path.is_file() and path.stat().st_size > 0
-                else _empty_document(fmt)
-            )
+            document = self._read_or_empty(path, fmt)
             document = _assign(document, parsed.keys, value, fmt)
         else:
             document = _prepare_whole_document(fmt, value)
         _write_document(path, fmt, document)
         return self
 
+    def __getitem__(self, spec: str) -> Any:
+        self.ensure_file(spec)
+        value = self._fetch(spec)
+        if value is _MISSING:
+            raise KeyError(spec)
+        return value
+
+    def __setitem__(self, spec: str, value: Any) -> None:
+        self.set(spec, value)
+
+    def __contains__(self, spec: object) -> bool:
+        return isinstance(spec, str) and self._fetch(spec) is not _MISSING
+
+    def patch(self, spec: str, updates: dict[str, Any]) -> Self:
+        """Deep-merge ``updates`` into a file or nested mapping, creating it if needed."""
+        if not isinstance(updates, dict):
+            raise TypeError(
+                f"patch() requires a dict, got {type(updates).__name__}"
+            )
+        parsed, fmt = self._parsed_file(spec)
+        path = self.ensure_file(spec)
+        document = self._read_or_empty(path, fmt)
+        if parsed.keys:
+            current = _lookup(document, parsed.keys, default=_MISSING)
+            if not isinstance(current, dict):
+                current = {}
+            merged = _deep_merge(current, updates)
+            document = _assign(document, parsed.keys, merged, fmt)
+        else:
+            base = _ini_as_dict(document) if fmt == "ini" else document
+            if not isinstance(base, dict):
+                raise TypeError(
+                    f"patch() target {spec!r} must be a mapping, got {type(base).__name__}"
+                )
+            document = _prepare_whole_document(fmt, _deep_merge(base, updates))
+        _write_document(path, fmt, document)
+        return self
+
+    def create(
+        self,
+        spec: str,
+        contents: Any = _MISSING,
+        *,
+        exist_ok: bool = True,
+    ) -> Path:
+        """Create a directory or structured file from a dotted spec.
+
+        Files are created as empty mappings unless ``contents`` is given.
+        Existing paths are left unchanged when ``exist_ok`` is true.
+        """
+        parsed = parse_spec(spec)
+        if parsed.keys:
+            raise ValueError(
+                f"create() does not take a key path ({spec!r}); use set() or patch()"
+            )
+        if parsed.fmt is None and contents is _MISSING:
+            path = self.resolve(parsed)
+            if path.exists() and not exist_ok:
+                raise FileExistsError(path)
+            return self.ensure_dir(spec)
+
+        parsed = self._bind_file(parsed)
+        fmt = parsed.fmt
+        if fmt is None:
+            raise ValueError(f"storage spec {spec!r} is a directory")
+        path = self.resolve(parsed)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if not exist_ok:
+                raise FileExistsError(path)
+            return path
+        document = (
+            _empty_document(fmt)
+            if contents is _MISSING
+            else _prepare_whole_document(fmt, contents)
+        )
+        _write_document(path, fmt, document)
+        return path
+
+    def load(self, spec: str) -> Any:
+        """Load a file (or nested key), creating an empty file if needed."""
+        parsed, fmt = self._parsed_file(spec)
+        path = self.ensure_file(spec)
+        document = _read_document(path, fmt)
+        if not parsed.keys:
+            return _public_document(fmt, document)
+        value = _lookup(document, parsed.keys, default=_MISSING)
+        if value is _MISSING:
+            raise KeyError(spec)
+        return value
+
+    def ensure_file(self, spec: str) -> Path:
+        """Create a structured file if it is missing; leave existing files as-is.
+
+        Adds ``default_format``'s extension when the spec omits one. Key suffixes
+        are ignored so ``ensure_file("settings:name")`` still creates the file.
+        """
+        parsed, fmt = self._parsed_file(spec)
+        path = self.resolve(parsed, ensure=True)
+        if path.is_dir():
+            raise IsADirectoryError(path)
+        if not path.is_file():
+            _write_document(path, fmt, _empty_document(fmt))
+        return path
+
+    def ensure_dir(self, spec: str) -> Path:
+        """Create a directory under data/ or config/ if it is missing."""
+        parsed = parse_spec(spec)
+        if parsed.keys or parsed.fmt is not None:
+            raise ValueError(
+                f"ensure_dir() requires a directory spec, got {spec!r}"
+            )
+        path = self.resolve(parsed)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def exists(self, spec: str) -> bool:
+        """Return whether a dotted directory, file, or key already exists."""
+        parsed = parse_spec(spec)
+        if parsed.keys:
+            return self._fetch(spec) is not _MISSING
+        if parsed.fmt is not None:
+            return self.resolve(parsed).is_file()
+        if self._existing_files(parsed):
+            return True
+        return self.resolve(parsed).is_dir()
+
     def _root(self, name: RootName) -> Path:
         return self._data_dir if name == "data" else self._config_dir
 
-    @staticmethod
-    def _require_file(parsed: StorageSpec, spec: str) -> FileFormat:
-        if parsed.fmt is None:
+    def _parsed_file(self, spec: str) -> tuple[StorageSpec, FileFormat]:
+        parsed = self._bind_file(parse_spec(spec))
+        fmt = parsed.fmt
+        if fmt is None:
             raise ValueError(
-                f"storage spec {spec!r} is a directory; get/set require "
-                "a .toml, .yaml, .yml, .json, or .ini file"
+                f"storage spec {spec!r} is a directory; file operations require "
+                "a file name, optionally with .toml, .yaml, .yml, .json, or .ini"
             )
-        return parsed.fmt
+        return parsed, fmt
+
+    def _bind_file(self, parsed: StorageSpec) -> StorageSpec:
+        """Attach a concrete format and filename when the spec omitted an extension."""
+        if parsed.fmt is not None:
+            return parsed
+        if parsed.relative == Path():
+            raise ValueError(
+                "file operations require a file name under data/ or config/"
+            )
+        matches = self._existing_files(parsed)
+        if len(matches) > 1:
+            names = ", ".join(relative.as_posix() for _, _, relative in matches)
+            raise ValueError(
+                f"ambiguous storage file {parsed.relative.as_posix()!r}: {names}"
+            )
+        if len(matches) == 1:
+            _, fmt, relative = matches[0]
+            return replace(parsed, relative=relative, fmt=fmt)
+        return replace(
+            parsed,
+            relative=parsed.relative.with_suffix(
+                _DEFAULT_EXTENSION[self._default_format]
+            ),
+            fmt=self._default_format,
+        )
+
+    def _existing_files(
+        self, parsed: StorageSpec
+    ) -> list[tuple[Path, FileFormat, Path]]:
+        root = self._root(parsed.root)
+        found: list[tuple[Path, FileFormat, Path]] = []
+        for ext, fmt in _FORMAT_EXTENSIONS:
+            relative = parsed.relative.with_suffix(ext)
+            path = root / relative
+            if path.is_file():
+                found.append((path, fmt, relative))
+        return found
+
+    def _fetch(self, spec: str) -> Any:
+        parsed, fmt = self._parsed_file(spec)
+        path = self.resolve(parsed)
+        if not path.is_file():
+            return _MISSING
+        document = _read_document(path, fmt)
+        if not parsed.keys:
+            return _public_document(fmt, document)
+        return _lookup(document, parsed.keys, default=_MISSING)
+
+    @staticmethod
+    def _read_or_empty(path: Path, fmt: FileFormat) -> Any:
+        if path.is_file() and path.stat().st_size > 0:
+            return _read_document(path, fmt)
+        return _empty_document(fmt)
 
 
 def _split_keys(spec: str) -> tuple[str, tuple[str, ...]]:
@@ -239,6 +440,20 @@ def _empty_document(fmt: FileFormat) -> Any:
     if fmt == "ini":
         return _new_ini_parser()
     return {}
+
+
+def _public_document(fmt: FileFormat, document: Any) -> Any:
+    return _ini_as_dict(document) if fmt == "ini" else document
+
+
+def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        existing = base.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _deep_merge(existing, value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
 
 
 def _prepare_whole_document(fmt: FileFormat, value: Any) -> Any:
@@ -455,3 +670,5 @@ def _decode_ini(raw: str) -> Any:
         return json.loads(raw)
     except json.JSONDecodeError:
         return raw
+
+

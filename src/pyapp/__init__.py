@@ -5,6 +5,7 @@ import yaml
 from importlib import resources
 
 from .runtime import AppStorageManager
+from .program import Program, ProcessResult
 
 
 def load_package_file(
@@ -37,6 +38,14 @@ def persist_to_yaml(data: dict, filepath: str | Path):
 
 
 def main():
-    app_store = AppStorageManager("test_app", "", base_data_dir = "./pyapp", base_config_dir = "./pyapp")
-    app_store.set("pyapp.toml:a", "hi")
-    pass
+    app_store = AppStorageManager(
+        "tgzoomr", 
+        base_data_dir="test-app", 
+        base_config_dir="test-app"
+    )
+
+    app_store["settings.yaml:cluser_name"] = "a"
+
+    cat = Program("cat")
+    result = cat.run("-n", "test-app/settings.yaml")
+    print(result.stdout)
