@@ -20,7 +20,7 @@ def load_package_file(
 def extract_from_yaml(utf8_data: str, safe: bool) -> Dict[str, str]:
     """Extract YAML from file into a dictionary.
     """
-    return yaml.safe_load(utf8_data) if safe else yaml.load(utf8_data)
+    return yaml.safe_load(utf8_data) if safe else yaml.load(utf8_data, Loader=yaml.FullLoader)
 
 
 def persist_to_yaml(data: dict, filepath: str | Path):
