@@ -4,6 +4,8 @@ from typing import Any, Dict
 import yaml
 from importlib import resources
 
+from .runtime import AppStorageManager
+
 
 def load_package_file(
         module: str, 
@@ -34,3 +36,7 @@ def persist_to_yaml(data: dict, filepath: str | Path):
         file.write(yaml.dump(data))
 
 
+def main():
+    app_store = AppStorageManager("test_app", "", base_data_dir = "./pyapp", base_config_dir = "./pyapp")
+    app_store.set("pyapp.toml:a", "hi")
+    pass
